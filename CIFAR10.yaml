@@ -1,0 +1,4 @@
+params:
+  T: 1000
+  beta_start: 0.001
+  beta_end: 0.02
