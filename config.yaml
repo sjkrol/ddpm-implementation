@@ -1,0 +1,5 @@
+cifar10:
+  channel_mult: [1, 2, 2, 2]
+  initial_channels: 128
+  num_res_blocks: 2
+  in_resolution: 32
