@@ -117,14 +117,11 @@ class UNet(nn.Module):
         t_emb = self.time_embedding(time_steps, TIME_EMBEDDING_DIM)
         t_emb = self.time_MLP(t_emb)
 
-        print(f"Input shape: {x.shape}")
-
         # pass through input convolution to get to the desired number of channels
         x = self.input_conv(x)
         hs = [x]
 
         # pass through down blocks
-        print("Down Blocks:")
         for block in self.down_blocks:
             if isinstance(block, ResBlock):
                 x = block(x, t_emb)
@@ -134,7 +131,6 @@ class UNet(nn.Module):
             if not isinstance(block, SelfAttention):
                 hs.append(x)  # store the output of each block for skip connections
         
-        print("Middle Blocks:")
         for block in self.middle_blocks:
             if isinstance(block, ResBlock):
                 x = block(x, t_emb)
@@ -150,8 +146,6 @@ class UNet(nn.Module):
 
         # pass through final convolution to get the desired output channels
         return self.silu(self.output_norm(self.final_conv(x)))
-
-
 
 
     def time_embedding(self, 

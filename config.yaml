@@ -1,5 +1,12 @@
 cifar10:
-  channel_mult: [1, 2, 2, 2]
-  initial_channels: 128
+  channel_multipliers: [1, 2, 2, 2]
+  base_channels: 128
   num_res_blocks: 2
   in_resolution: 32
+training:
+  batch_size: 32
+  lr: 1e-3
+  lr_scheduler:
+    step_size: 10
+    gamma: 0.1
+  num_epochs: 50
