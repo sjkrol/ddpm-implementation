@@ -4,9 +4,19 @@ cifar10:
   num_res_blocks: 2
   in_resolution: 32
 training:
-  batch_size: 32
+  batch_size: 128
   lr: 1e-3
   lr_scheduler:
     step_size: 10
     gamma: 0.1
   num_epochs: 50
+
+wandb:
+  enabled: true
+  project: ddpm-cifar10
+  entity: "stephen-krol-monash-university"
+  run_name: test-run-2
+  mode: online
+  log_every_steps: 10
+  tags: [ddpm, cifar10]
+  notes: null

@@ -96,7 +96,7 @@ class UNet(nn.Module):
 
         # Final convolution to get the desired output channels
         self.final_conv = nn.Conv2d(in_channels, original_channels, kernel_size=1)
-        self.output_norm = nn.GroupNorm(num_groups=original_channels, num_channels=original_channels)
+        self.output_norm = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=base_channels)
         self.silu = nn.SiLU()
     
     def forward(self, x: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
@@ -145,7 +145,7 @@ class UNet(nn.Module):
                 x = block(x)
 
         # pass through final convolution to get the desired output channels
-        return self.silu(self.output_norm(self.final_conv(x)))
+        return self.final_conv(self.silu(self.output_norm(x)))
 
 
     def time_embedding(self, 
@@ -166,9 +166,11 @@ class UNet(nn.Module):
         :rtype: torch.Tensor
         """
 
+        time_steps = time_steps.float()
         half_dim = embedding_dim // 2
-        emb = torch.exp(torch.arange(half_dim) * -(torch.log(torch.tensor(10000.0)) / half_dim))
-        emb = time_steps[:, None] * emb[None, :]
+        frequency = torch.arange(half_dim, device=time_steps.device, dtype=torch.float32)
+        frequency = torch.exp(-torch.log(torch.tensor(10000.0, device=time_steps.device)) * frequency / half_dim)
+        emb = time_steps[:, None] * frequency[None, :]
         emb = torch.cat((torch.sin(emb), torch.cos(emb)), dim=-1)
         return emb
 

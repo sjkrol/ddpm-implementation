@@ -83,7 +83,7 @@ Controls the model and optimisation setup:
 Create a Python environment and install the main dependencies:
 
 ```bash
-pip install torch torchvision matplotlib pyyaml
+pip install torch torchvision matplotlib pyyaml wandb
 ```
 
 ## Running Training
@@ -93,6 +93,9 @@ From the repository root, run:
 ```bash
 python diffusion.py
 ```
+
+To enable Weights & Biases logging, set `wandb.enabled: true` in `config.yaml`.
+You can also set `wandb.project`, `wandb.entity`, `wandb.run_name`, and `wandb.log_every_steps`.
 
 The dataset will download automatically into the `data/` directory if needed.
 
