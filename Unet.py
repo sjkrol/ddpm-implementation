@@ -1,6 +1,7 @@
 
 import torch
 import torch.nn as nn
+import math
 
 import yaml
 
@@ -8,6 +9,28 @@ CONV_BLOCKS = 2
 ATTEN_LAYER = 16
 GROUP_NORM_GROUPS = 4
 TIME_EMBEDDING_DIM = 16
+
+
+def default_init_(weight: torch.Tensor, scale: float) -> None:
+    """
+    TensorFlow-style variance scaling init with fan_avg + uniform distribution.
+    Mirrors:
+    tf.initializers.variance_scaling(scale=1e-10 if scale == 0 else scale, mode='fan_avg', distribution='uniform')
+    """
+    init_scale = 1e-10 if scale == 0 else scale
+    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(weight)
+    fan_avg = (fan_in + fan_out) / 2.0
+    limit = math.sqrt(3.0 * init_scale / fan_avg)
+    with torch.no_grad():
+        weight.uniform_(-limit, limit)
+
+
+def init_weight_and_bias_(module: nn.Module, scale: float = 1.0) -> None:
+    """Apply default_init_ to weights and zero-initialize biases when available."""
+    if hasattr(module, "weight") and module.weight is not None:
+        default_init_(module.weight, scale)
+    if hasattr(module, "bias") and module.bias is not None:
+        nn.init.zeros_(module.bias)
 
 class UNet(nn.Module):
     def __init__(self, original_channels: int=3, base_channels: int=128, channel_multipliers: list=[1, 2, 2, 2], num_res_blocks: int=2, in_resolution: int=32) -> None:
@@ -40,6 +63,7 @@ class UNet(nn.Module):
 
         # input convolution to get to the desired number of channels
         self.input_conv = nn.Conv2d(original_channels, base_channels, kernel_size=3, stride=1, padding=1)
+        init_weight_and_bias_(self.input_conv)
 
         in_channels = base_channels # set initial in channels to base channels after the input convolution
         channels = [base_channels]  # to keep track of the number of channels at each block for skip connections
@@ -96,6 +120,7 @@ class UNet(nn.Module):
 
         # Final convolution to get the desired output channels
         self.final_conv = nn.Conv2d(in_channels, original_channels, kernel_size=1)
+        init_weight_and_bias_(self.final_conv)
         self.output_norm = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=base_channels)
         self.silu = nn.SiLU()
     
@@ -146,6 +171,21 @@ class UNet(nn.Module):
 
         # pass through final convolution to get the desired output channels
         return self.final_conv(self.silu(self.output_norm(x)))
+
+    def parameter_count(self, trainable_only: bool = False) -> int:
+        """
+        Returns the total number of parameters in the model.
+
+        :param trainable_only: if True, count only parameters with requires_grad=True
+        :type trainable_only: bool
+
+        :return: total number of parameters
+        :rtype: int
+        """
+
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
 
 
     def time_embedding(self, 
@@ -201,15 +241,20 @@ class ResBlock(nn.Module):
 
         # first convolutional block
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        init_weight_and_bias_(self.conv1)
 
         # second convolutional block
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        init_weight_and_bias_(self.conv2)
 
         # time projection layer
         self.time_proj = nn.Linear(time_embedding_dim, out_channels)
+        init_weight_and_bias_(self.time_proj)
 
         # for skip connection, if the number of input channels is different from the number of output channels, we need to project the input to the correct number of channels
         self.x_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        if isinstance(self.x_conv, nn.Conv2d):
+            init_weight_and_bias_(self.x_conv)
 
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
@@ -265,8 +310,10 @@ class TimeMLP(nn.Module):
         """
         super(TimeMLP, self).__init__()
         self.linear1 = nn.Linear(embedding_dim, embedding_dim * 4)
+        init_weight_and_bias_(self.linear1)
         self.silu = nn.SiLU()
         self.linear2 = nn.Linear(embedding_dim * 4, embedding_dim)
+        init_weight_and_bias_(self.linear2)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -301,6 +348,9 @@ class SelfAttention(nn.Module):
         self.W_q = nn.Linear(in_channels, in_channels)
         self.W_k = nn.Linear(in_channels, in_channels)
         self.W_v = nn.Linear(in_channels, in_channels)
+        init_weight_and_bias_(self.W_q)
+        init_weight_and_bias_(self.W_k)
+        init_weight_and_bias_(self.W_v)
 
         self.norm = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=in_channels)
 
@@ -341,11 +391,17 @@ class SelfAttention(nn.Module):
         
 if __name__ == "__main__":
     
-    yaml_path = "/Users/sjkro1/Documents/Personal/coding/DiffusionImplementation/config.yaml"
+    yaml_path = "config.yaml"
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
     
-    model = UNet()  
+    model = UNet(original_channels=3, 
+                 base_channels=config["cifar10"]["base_channels"], 
+                 channel_multipliers=config["cifar10"]["channel_multipliers"],
+                 num_res_blocks=config["cifar10"]["num_res_blocks"],
+                 in_resolution=config["cifar10"]["in_resolution"])
+    
+    print("Total parameters:", model.parameter_count())
 
     x = torch.randn(4, 3, 32, 32)  # Example input image
     time_steps = torch.tensor([10])  # Example time step

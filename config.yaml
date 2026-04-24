@@ -3,19 +3,24 @@ cifar10:
   base_channels: 128
   num_res_blocks: 2
   in_resolution: 32
+  T: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
 training:
   batch_size: 128
-  lr: 1e-3
+  lr: 2e-4
+  warmup_steps: 5000
   lr_scheduler:
     step_size: 10
     gamma: 0.1
-  num_epochs: 50
+  num_epochs: 2051
 
 wandb:
   enabled: true
   project: ddpm-cifar10
   entity: "stephen-krol-monash-university"
-  run_name: test-run-2
+  run_name: run-6
   mode: online
   log_every_steps: 10
   tags: [ddpm, cifar10]

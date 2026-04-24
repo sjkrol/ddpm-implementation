@@ -3,3 +3,4 @@ data/
 checkpoints/
 wandb/
 tea_debug.log
+test_samples/
