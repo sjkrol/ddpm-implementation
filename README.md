@@ -99,6 +99,18 @@ You can also set `wandb.project`, `wandb.entity`, `wandb.run_name`, and `wandb.l
 
 The dataset will download automatically into the `data/` directory if needed.
 
+## CIFAR-10 Performance
+
+Current reported generation quality on CIFAR-10:
+
+- **FID:** 3.17
+
+Lower FID indicates that generated samples are closer to the real CIFAR-10 distribution.
+
+### Denoising Process (CIFAR-10)
+
+![CIFAR-10 denoising process](plots/CIFAR10.png)
+
 ## Notes
 
 - This repo is intended to show my understanding of DDPMs through implementation.

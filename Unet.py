@@ -7,8 +7,7 @@ import yaml
 
 CONV_BLOCKS = 2
 ATTEN_LAYER = 16
-GROUP_NORM_GROUPS = 4
-TIME_EMBEDDING_DIM = 16
+GROUP_NORM_GROUPS = 32
 
 
 def default_init_(weight: torch.Tensor, scale: float) -> None:
@@ -33,8 +32,14 @@ def init_weight_and_bias_(module: nn.Module, scale: float = 1.0) -> None:
         nn.init.zeros_(module.bias)
 
 class UNet(nn.Module):
-    def __init__(self, original_channels: int=3, base_channels: int=128, channel_multipliers: list=[1, 2, 2, 2], num_res_blocks: int=2, in_resolution: int=32) -> None:
-        """
+    def __init__(self, 
+                 original_channels: int=3, 
+                 base_channels: int=128, 
+                 channel_multipliers: list=[1, 2, 2, 2], 
+                 num_res_blocks: int=2, 
+                 in_resolution: int=32,
+                 dropout: float=0.1) -> None:
+        """`
         Initializes the UNet architecture for a diffusion model. The UNet consists of a series of down blocks, a middle block, and a series of up blocks.
         The down blocks consist of residual blocks and optional self-attention layers, with max pooling for downsampling. 
         The middle block consists of residual blocks and a self-attention layer. The up blocks consist of residual blocks and optional self-attention layers,
@@ -58,8 +63,11 @@ class UNet(nn.Module):
         """
         super(UNet, self).__init__()
 
-        # time embedding MLP
-        self.time_MLP = TimeMLP(embedding_dim=TIME_EMBEDDING_DIM)
+        self.time_embedding_dim = base_channels * 4
+        self.base_channels = base_channels
+
+        # time embedding MLP takes base channels as embedding dim but outputs base channels * 4
+        self.time_MLP = TimeMLP(embedding_dim=base_channels) 
 
         # input convolution to get to the desired number of channels
         self.input_conv = nn.Conv2d(original_channels, base_channels, kernel_size=3, stride=1, padding=1)
@@ -76,7 +84,7 @@ class UNet(nn.Module):
             out_channels = base_channels * channel_multiplier
 
             for _ in range(num_res_blocks):
-                self.down_blocks.append(ResBlock(in_channels, out_channels, time_embedding_dim=TIME_EMBEDDING_DIM))
+                self.down_blocks.append(ResBlock(in_channels, out_channels, time_embedding_dim=self.time_embedding_dim, dropout=dropout))
                 channels.append(out_channels)
                 in_channels = out_channels
 
@@ -84,7 +92,8 @@ class UNet(nn.Module):
                     self.down_blocks.append(SelfAttention(in_channels))
 
             if i != len(channel_multipliers) - 1:
-                self.down_blocks.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                self.down_blocks.append(nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1))  # downsample by a factor of 2 using conv with stride 2
+                init_weight_and_bias_(self.down_blocks[-1])
                 channels.append(out_channels)
                 in_resolution = in_resolution // 2
 
@@ -93,9 +102,9 @@ class UNet(nn.Module):
         # the middle block consists of a residual block, followed by a self-attention layer, and then another residual block. 
         # The number of channels in the middle block is the same as the output channels of the last down block.
         self.middle_blocks = nn.ModuleList()
-        self.middle_blocks.append(ResBlock(in_channels, in_channels, time_embedding_dim=TIME_EMBEDDING_DIM))
+        self.middle_blocks.append(ResBlock(in_channels, in_channels, time_embedding_dim=self.time_embedding_dim, dropout=dropout))
         self.middle_blocks.append(SelfAttention(in_channels, is_middle_section=True))
-        self.middle_blocks.append(ResBlock(in_channels, in_channels, time_embedding_dim=TIME_EMBEDDING_DIM))
+        self.middle_blocks.append(ResBlock(in_channels, in_channels, time_embedding_dim=self.time_embedding_dim, dropout=dropout))
 
         # create up blocks
         # each upblock consists of num_res_blocks residual blocks, followed by an optional self-attention layer if the 
@@ -106,7 +115,7 @@ class UNet(nn.Module):
 
             # add residual blocks
             for _ in range(num_res_blocks + 1):  # +1 to account for the skip connection concatenation
-                self.up_blocks.append(ResBlock(in_channels + channels.pop(), out_channels, time_embedding_dim=TIME_EMBEDDING_DIM  ))
+                self.up_blocks.append(ResBlock(in_channels + channels.pop(), out_channels, time_embedding_dim=self.time_embedding_dim, dropout=dropout))
                 in_channels = out_channels
 
                 # add self-attention layer if resolution matches
@@ -115,7 +124,9 @@ class UNet(nn.Module):
             
             # upsample using conv transpose
             if i != 0:
-                self.up_blocks.append(nn.ConvTranspose2d(in_channels, in_channels, kernel_size=2, stride=2))
+                self.up_blocks.append(nn.Upsample(scale_factor=2, mode='nearest'))  # upsample by a factor of 2 using nearest neighbor upsampling
+                self.up_blocks.append(nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1))  # follow up with a conv layer to smooth the upsampled output
+                init_weight_and_bias_(self.up_blocks[-1])
                 in_resolution = in_resolution * 2
 
         # Final convolution to get the desired output channels
@@ -139,7 +150,7 @@ class UNet(nn.Module):
         """
 
         # compute time embedding and pass through MLP
-        t_emb = self.time_embedding(time_steps, TIME_EMBEDDING_DIM)
+        t_emb = self.time_embedding(time_steps, self.base_channels)
         t_emb = self.time_MLP(t_emb)
 
         # pass through input convolution to get to the desired number of channels
@@ -154,7 +165,9 @@ class UNet(nn.Module):
                 x = block(x)
             
             if not isinstance(block, SelfAttention):
-                hs.append(x)  # store the output of each block for skip connections
+                hs.append(x)
+            else:
+                hs[-1] = x  # if it's a self-attention layer, we don't want to add the output to the skip connections, so we just repeat the last element in hs
         
         for block in self.middle_blocks:
             if isinstance(block, ResBlock):
@@ -217,7 +230,10 @@ class UNet(nn.Module):
 
 class ResBlock(nn.Module):
 
-    def __init__(self, in_channels: int, out_channels: int, time_embedding_dim: int) -> None:
+    def __init__(self, in_channels: int, 
+                 out_channels: int, 
+                 time_embedding_dim: int,
+                 dropout: float=0.1) -> None:
         """
         Initializes a residual block with time embedding.
         @author: Stephen Krol
@@ -228,6 +244,8 @@ class ResBlock(nn.Module):
         :type out_channels: int
         :param time_embedding_dim: the dimension of the time embedding
         :type time_embedding_dim: int
+        :param dropout: the dropout rate to apply after the first convolution (default: 0.1)
+        :type dropout: float
 
         :return: None
         :rtype: None
@@ -237,7 +255,7 @@ class ResBlock(nn.Module):
         self.norm1 = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=in_channels)
         self.norm2 = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=out_channels)
         self.silu = nn.SiLU()
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
         # first convolutional block
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
@@ -312,7 +330,7 @@ class TimeMLP(nn.Module):
         self.linear1 = nn.Linear(embedding_dim, embedding_dim * 4)
         init_weight_and_bias_(self.linear1)
         self.silu = nn.SiLU()
-        self.linear2 = nn.Linear(embedding_dim * 4, embedding_dim)
+        self.linear2 = nn.Linear(embedding_dim * 4, embedding_dim * 4)
         init_weight_and_bias_(self.linear2)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -348,9 +366,11 @@ class SelfAttention(nn.Module):
         self.W_q = nn.Linear(in_channels, in_channels)
         self.W_k = nn.Linear(in_channels, in_channels)
         self.W_v = nn.Linear(in_channels, in_channels)
+        self.W_o = nn.Linear(in_channels, in_channels)
         init_weight_and_bias_(self.W_q)
         init_weight_and_bias_(self.W_k)
         init_weight_and_bias_(self.W_v)
+        init_weight_and_bias_(self.W_o)
 
         self.norm = nn.GroupNorm(num_groups=GROUP_NORM_GROUPS, num_channels=in_channels)
 
@@ -384,6 +404,7 @@ class SelfAttention(nn.Module):
 
         # compute output
         out = torch.bmm(atten_scores, v)  # (B, H*W, C)
+        out = self.W_o(out)
         out = out.permute(0, 2, 1).view(B, C, H, W)  # (B, C, H, W)
 
         return out + x
