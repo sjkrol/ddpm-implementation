@@ -21,6 +21,11 @@ try:
 except ImportError:
     FrechetInceptionDistance = None
 
+try:
+    from torchmetrics.image.inception import InceptionScore
+except ImportError:
+    InceptionScore = None
+
 def sample(model: torch.nn.Module,
            noise_schedule: torch.Tensor,
            num_samples: int, 
@@ -149,7 +154,8 @@ def calculate_fid(model: torch.nn.Module,
                   num_real: int,
                   num_fake: int,
                   batch_size: int,
-                  device: torch.device) -> float:
+                  device: torch.device,
+                  fake_batches: list = None) -> float:
     """
     Calculates FID against the CIFAR10 training split using generated samples.
     This matches the evaluation setup reported in the DDPM paper.
@@ -167,6 +173,9 @@ def calculate_fid(model: torch.nn.Module,
     :type batch_size: int
     :param device: The device to run the evaluation on (e.g., 'cuda' or 'cpu').
     :type device: torch.device
+    :param fake_batches: Optional pre-generated list of uint8 fake image tensors. If
+        provided, sample generation is skipped and these batches are used directly.
+    :type fake_batches: list, optional
 
     :return: The calculated FID score.
     :rtype: float
@@ -199,14 +208,77 @@ def calculate_fid(model: torch.nn.Module,
         fid.update(_to_fid_uint8(real_batch), real=True)
         seen_real += real_batch.size(0)
 
-    seen_fake = 0
-    while seen_fake < num_fake:
-        current_batch = min(batch_size, num_fake - seen_fake)
-        fake_batch = sample(model, noise_schedule, current_batch, device)
-        fid.update(_to_fid_uint8(fake_batch), real=False)
-        seen_fake += current_batch
+    if fake_batches is not None:
+        for batch in fake_batches:
+            fid.update(batch.to(device), real=False)
+    else:
+        seen_fake = 0
+        while seen_fake < num_fake:
+            current_batch = min(batch_size, num_fake - seen_fake)
+            fake_batch = sample(model, noise_schedule, current_batch, device)
+            fid.update(_to_fid_uint8(fake_batch), real=False)
+            seen_fake += current_batch
 
     return float(fid.compute().item())
+
+
+def calculate_inception_score(
+        model: torch.nn.Module,
+        noise_schedule: torch.Tensor,
+        num_fake: int,
+        batch_size: int,
+        device: torch.device,
+        splits: int = 10,
+        fake_batches: list = None) -> Tuple[float, float]:
+    """
+    Calculates the Inception Score (IS) for generated samples.
+
+    IS = exp(E_x[ KL( p(y|x) || p(y) ) ])
+
+    A higher IS indicates more diverse and visually meaningful samples.
+    @author: Stephen Krol
+
+    :param model: The trained diffusion model.
+    :type model: torch.nn.Module
+    :param noise_schedule: The noise schedule used during training.
+    :type noise_schedule: torch.Tensor
+    :param num_fake: The number of fake samples to generate.
+    :type num_fake: int
+    :param batch_size: The batch size to use when generating samples.
+    :type batch_size: int
+    :param device: The device to run the evaluation on.
+    :type device: torch.device
+    :param splits: Number of splits for IS estimation (default 10).
+    :type splits: int
+    :param fake_batches: Optional pre-generated list of uint8 fake image tensors. If
+        provided, sample generation is skipped and these batches are used directly.
+    :type fake_batches: list, optional
+
+    :return: A tuple of (IS mean, IS std).
+    :rtype: Tuple[float, float]
+    """
+
+    if InceptionScore is None:
+        raise ImportError(
+            "torchmetrics with image IS support is required. "
+            "Install with: pip install torchmetrics[image]"
+        )
+
+    is_metric = InceptionScore(feature="logits_unbiased", splits=splits, normalize=False).to(device)
+
+    if fake_batches is not None:
+        for batch in fake_batches:
+            is_metric.update(batch.to(device))
+    else:
+        seen_fake = 0
+        while seen_fake < num_fake:
+            current_batch = min(batch_size, num_fake - seen_fake)
+            fake_batch = sample(model, noise_schedule, current_batch, device)
+            is_metric.update(_to_fid_uint8(fake_batch))
+            seen_fake += current_batch
+
+    mean, std = is_metric.compute()
+    return float(mean.item()), float(std.item())
 
 
 def calculate_metrics(model: torch.nn.Module,
@@ -216,7 +288,8 @@ def calculate_metrics(model: torch.nn.Module,
                       batch_size: int,
                       device: torch.device) -> dict:
     """
-    Function to calculate evaluation metrics for generated samples, currently only FID.
+    Function to calculate evaluation metrics for generated samples.
+    Samples are generated once and shared between FID and IS to avoid redundant computation.
     @author: Stephen Krol
 
     :param model: The trained diffusion model.
@@ -225,9 +298,9 @@ def calculate_metrics(model: torch.nn.Module,
     :type noise_schedule: torch.Tensor
     :param num_real: The number of real samples to use for FID calculation.
     :type num_real: int
-    :param num_fake: The number of fake samples to generate for FID calculation.
+    :param num_fake: The number of fake samples to generate for FID and IS calculation.
     :type num_fake: int
-    :param batch_size: The batch size to use during FID calculation.
+    :param batch_size: The batch size to use during evaluation.
     :type batch_size: int
     :param device: The device to run the evaluation on (e.g., 'cuda' or 'cpu').
     :type device: torch.device
@@ -237,6 +310,15 @@ def calculate_metrics(model: torch.nn.Module,
     :rtype: dict
     """
 
+    # Generate fake samples once; store as uint8 on CPU to save GPU memory.
+    fake_batches = []
+    seen_fake = 0
+    while seen_fake < num_fake:
+        current_batch = min(batch_size, num_fake - seen_fake)
+        fake_batch = sample(model, noise_schedule, current_batch, device)
+        fake_batches.append(_to_fid_uint8(fake_batch).cpu())
+        seen_fake += current_batch
+
     fid_score = calculate_fid(
         model=model,
         noise_schedule=noise_schedule,
@@ -244,11 +326,21 @@ def calculate_metrics(model: torch.nn.Module,
         num_fake=num_fake,
         batch_size=batch_size,
         device=device,
+        fake_batches=fake_batches,
+    )
+
+    is_mean, is_std = calculate_inception_score(
+        model=model,
+        noise_schedule=noise_schedule,
+        num_fake=num_fake,
+        batch_size=batch_size,
+        device=device,
+        fake_batches=fake_batches,
     )
 
     metrics = {
         "FID": fid_score,
-        "IS": None,
+        "IS": {"mean": is_mean, "std": is_std},
     }
     
     return metrics
