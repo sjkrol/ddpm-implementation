@@ -26,13 +26,13 @@ try:
 except ImportError:
     InceptionScore = None
 
-def sample(model: torch.nn.Module,
+def ddpm_sample(model: torch.nn.Module,
            noise_schedule: torch.Tensor,
            num_samples: int, 
            device: torch.device,
            resolution: Tuple[int, int] = (32, 32)) -> torch.Tensor:
     """
-    Function to generate samples from the trained model.
+    Function to generate samples from the trained model using DDPM sampling.
     @author: Stephen Krol
 
     :param model: The trained diffusion model.
@@ -51,19 +51,18 @@ def sample(model: torch.nn.Module,
     noise_schedule = noise_schedule.to(device)
     alpha_bar = calculate_alpha_bar(noise_schedule).to(device)
     x = torch.randn(num_samples, 3, resolution[0], resolution[1], device=device)  # Start with random noise
-
     for t in tqdm(reversed(range(noise_schedule.shape[0]))):
         with torch.no_grad():
             
-            x = update_helper(x, model, noise_schedule, alpha_bar, t)
+            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t)
 
     return x
 
-def update_helper(x: torch.Tensor,
-                  model: torch.nn.Module,
-                  noise_schedule: torch.Tensor,
-                  alpha_bar: torch.Tensor,
-                  t: int) -> torch.Tensor:
+def ddpm_update_helper(x: torch.Tensor,
+                       model: torch.nn.Module,
+                       noise_schedule: torch.Tensor,
+                       alpha_bar: torch.Tensor,
+                       t: int) -> torch.Tensor:
     """
     Helper function to update the sample during the denoising process.
     @author: Stephen Krol
@@ -96,6 +95,92 @@ def update_helper(x: torch.Tensor,
 
     return 1 / a_t.sqrt() * (x - (1 - a_t) / (1 - alpha_bar[t]).sqrt() * noise_pred) + noise_schedule[t].sqrt() * z    
 
+def ddim_sample(model: torch.nn.Module,
+                noise_schedule: torch.Tensor,
+                num_samples: int,
+                device: torch.device,
+                resolution: Tuple[int, int] = (32, 32),
+                eta: float = 0.0,
+                sampling_steps: int = 200) -> torch.Tensor:
+    """
+    Function to generate samples from the trained model using DDIM sampling.
+    @author: Stephen Krol
+
+    :param model: The trained diffusion model.
+    :type model: torch.nn.Module
+    :param noise_schedule: The noise schedule used during training.
+    :type noise_schedule: torch.Tensor
+    :param num_samples: The number of samples to generate.
+    :type num_samples: int
+    :param device: The device to run the sampling on (e.g., 'cuda', 'cpu').
+    :type device: torch.device
+    :param eta: The noise scale for DDIM sampling (default 0.0 for deterministic sampling).
+    :type eta: float
+    :param sampling_steps: The number of sampling steps to use (default 200).
+    :type sampling_steps: int
+
+    :return: A tensor containing the generated samples.
+    :rtype: torch.Tensor
+    """
+
+    noise_schedule = noise_schedule.to(device)
+    alpha_bar = calculate_alpha_bar(noise_schedule).to(device)
+    x = torch.randn(num_samples, 3, resolution[0], resolution[1], device=device)  # Start with random noise
+
+    # Create a list of timesteps to sample from, spaced evenly across the noise schedule
+    total_steps = noise_schedule.shape[0]
+    step_size = max(1, total_steps // sampling_steps)
+    t_s = list(reversed(range(0, total_steps, step_size))) # sampling timesteps in reverse order (from T-1 down to 0)
+
+    for i, t in tqdm(enumerate(t_s), desc="DDIM Sampling"):
+        with torch.no_grad():
+
+            t_prev = t_s[i + 1] if i < len(t_s) - 1 else 0 # because t_s is reversed, the "previous" timestep is actually the next one in the list
+            x = ddim_update_helper(x, model, noise_schedule, alpha_bar, t, t_prev, eta)
+
+    return x
+
+def ddim_update_helper(x: torch.Tensor,
+                       model: torch.nn.Module,
+                       noise_schedule: torch.Tensor,
+                       alpha_bar: torch.Tensor,
+                       t: int,
+                       t_prev: int,
+                       eta: float) -> torch.Tensor:
+    """
+    Helper function to update the sample during the DDIM denoising process.
+    @author: Stephen Krol
+
+    :param x: The current sample tensor.
+    :type x: torch.Tensor
+    :param model: The trained diffusion model.
+    :type model: torch.nn.Module
+    :param noise_schedule: The noise schedule used during training.
+    :type noise_schedule: torch.Tensor
+    :param alpha_bar: The cumulative product of (1 - beta) values from the noise schedule.
+    :type alpha_bar: torch.Tensor
+    :param t: The current timestep.
+    :type t: int
+    :param t_prev: The previous timestep in the sampling process.
+    :type t_prev: int
+    :param eta: The noise scale for DDIM sampling.
+    :type eta: float
+
+    :return: The updated sample tensor after one DDIM denoising step.
+    :rtype: torch.Tensor
+    """
+
+    noise_pred = model(x, torch.full((x.size(0),), t, device=device, dtype=torch.long))
+    sigma_t = eta * ((1 - alpha_bar[t_prev]) / (1 - alpha_bar[t])).sqrt() * (1 - alpha_bar[t] / alpha_bar[t_prev]).sqrt() if t > 0 else 0.0
+
+    if t > 0:
+        z = torch.randn_like(x)
+    else:
+        z = torch.zeros_like(x)
+    
+    x = alpha_bar[t_prev].sqrt() * ((x - (1 - alpha_bar[t]).sqrt() * noise_pred) / alpha_bar[t].sqrt()) + (1 - alpha_bar[t_prev] - sigma_t**2).sqrt() * noise_pred + sigma_t * z
+
+    return x
 
 def load_model(checkpoint_path: str, 
                config: dict,
@@ -315,7 +400,7 @@ def calculate_metrics(model: torch.nn.Module,
     seen_fake = 0
     while seen_fake < num_fake:
         current_batch = min(batch_size, num_fake - seen_fake)
-        fake_batch = sample(model, noise_schedule, current_batch, device)
+        fake_batch = ddpm_sample(model, noise_schedule, current_batch, device)
         fake_batches.append(_to_fid_uint8(fake_batch).cpu())
         seen_fake += current_batch
 
@@ -417,7 +502,7 @@ def plot_denoising_process(model: torch.nn.Module,
     images = []
     for t in tqdm(reversed(range(noise_schedule.shape[0])), desc="Denoising process"):
         with torch.no_grad():
-            x = update_helper(x, model, noise_schedule, alpha_bar, t)
+            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t)
 
         if t in step_indices_set or t == 0:
             images.append(x.cpu())
@@ -477,16 +562,16 @@ if __name__ == "__main__":
     # )
     # print(f"FID ({fid_num_fake} fake / {fid_num_real} real): {metrics['FID']:.4f}")
 
-    samples = sample(model, noise_schedule, 10, device)
-    save_samples(samples, "test_samples")
+    samples = ddim_sample(model, noise_schedule, 10, device, eta=0.2)
+    save_samples(samples, "ddim_test_samples")
 
-    plot_denoising_process(
-        model=model,
-        noise_schedule=noise_schedule,
-        num_samples=5,
-        device=device,
-        step_interval=10,
-        spacing_strength=2.0,
-        resolution=(32, 32),
-        save_path="denoising_process.png",
-    )
+    # plot_denoising_process(
+    #     model=model,
+    #     noise_schedule=noise_schedule,
+    #     num_samples=5,
+    #     device=device,
+    #     step_interval=10,
+    #     spacing_strength=2.0,
+    #     resolution=(32, 32),
+    #     save_path="denoising_process.png",
+    # )
