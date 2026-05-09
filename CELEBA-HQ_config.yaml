@@ -1,20 +1,20 @@
-cifar10:
-  channel_multipliers: [1, 2, 2, 2]
+model:
+  channel_multipliers: [1, 1, 2, 2, 4, 4]
   base_channels: 128
   num_res_blocks: 2
-  in_resolution: 32
+  in_resolution: 256
   T: 1000
   beta_start: 0.0001
   beta_end: 0.02
 
 training:
-  batch_size: 128
-  lr: 2e-4
+  batch_size: 8
+  lr: 2e-5
   warmup_steps: 5000
   lr_scheduler:
     step_size: 10
     gamma: 0.1
-  num_epochs: 2051
+  num_epochs: 640
 
 evaluation:
   fid_samples: 50000
@@ -22,10 +22,10 @@ evaluation:
 
 wandb:
   enabled: true
-  project: ddpm-cifar10
+  project: ddpm-celeba-hq
   entity: "stephen-krol-monash-university"
-  run_name: run-7
+  run_name: run-2
   mode: online
   log_every_steps: 10
-  tags: [ddpm, cifar10]
+  tags: [ddpm, celeba-hq]
   notes: null

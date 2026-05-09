@@ -7,32 +7,16 @@ import copy
 import yaml
 import torch
 import wandb
+import argparse
 from tqdm.auto import tqdm
 from torchvision import datasets, transforms
 from Unet import UNet
 
 from utils import plot_images, LABEL_TO_CLASS, plot_image_noisy_pairs, plot_random_images
+from datasets.cifar10 import load_cifar10_data
+from datasets.celeba_hq256 import load_celeba_hq256_data
 
 EMA_DECAY = 0.9999
-
-def load_cifar10_data() -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
-    """
-    Loads the CIFAR-10 dataset and returns the training and test sets.
-    @author: Stephen Krol
-
-    :return: the training and test sets
-    :rtype: tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]
-    """
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-
-    train_set = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-    test_set = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
-
-    return train_set, test_set
 
 
 def calculate_noise_schedule(T: int, beta_start: float, beta_end: float) -> torch.Tensor:
@@ -103,10 +87,10 @@ class DiffusionDataset(torch.utils.data.Dataset):
     @author: Stephen Krol
     """
 
-    def __init__(self, dataset: torch.utils.data.Dataset, 
+    def __init__(self, 
+                 dataset: torch.utils.data.Dataset, 
                  noise_schedule: torch.Tensor, 
-                 train: bool=True,
-                 device="cpu"):
+                 train: bool=True):
         """
         Initializes the dataset with the given dataset and noise schedule.
         @author: Stephen Krol
@@ -117,8 +101,6 @@ class DiffusionDataset(torch.utils.data.Dataset):
         :type noise_schedule: torch.Tensor
         :param train: whether the dataset is for training (applies data augmentation)
         :type train: bool
-        :param device: the device to run the computation on
-        :type device: str
         """
         self.dataset = dataset
         self.noise_schedule = noise_schedule
@@ -129,6 +111,7 @@ class DiffusionDataset(torch.utils.data.Dataset):
         self.transform = transforms.Compose([
             transforms.RandomHorizontalFlip()
         ])
+
     def __len__(self) -> int:
         return len(self.dataset)
 
@@ -209,7 +192,7 @@ class Trainer:
             self.scheduler = None
 
         # Set up data loaders with worker and memory settings for better throughput.
-        num_workers = min(4, os.cpu_count() or 1)
+        num_workers = min(12, os.cpu_count() or 1)
         pin_memory = self.device == "cuda"
 
         self.train_dataloader = torch.utils.data.DataLoader(
@@ -261,7 +244,7 @@ class Trainer:
         if not os.path.exists(base_dir):
             os.makedirs(base_dir)
 
-        self.save_dir = os.path.join(base_dir, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        self.save_dir = os.path.join(base_dir, wandb_config.get("project"),  datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         os.makedirs(self.save_dir, exist_ok=True)
         self.ema_checkpoint_path = os.path.join(self.save_dir, "ema_model.pth")
 
@@ -343,7 +326,6 @@ class Trainer:
 
                 self.optimiser.zero_grad()
                 eps_hat = self.model(x_t, t)
-
                 loss = self.loss_fn(eps_hat, eps)
                 loss.backward()
                 self.optimiser.step()
@@ -418,22 +400,28 @@ class Trainer:
 
 if __name__ == "__main__":
 
-    with open("config.yaml", "r") as f:
+    parser = argparse.ArgumentParser(description="Train a DDPM on CIFAR-10")
+    parser.add_argument("--config", type=str, help="Path to the configuration file")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    noise_schedule = calculate_noise_schedule(config["cifar10"]["T"], config["cifar10"]["beta_start"], config["cifar10"]["beta_end"])  
+    noise_schedule = calculate_noise_schedule(config["model"]["T"], config["model"]["beta_start"], config["model"]["beta_end"])  
 
-    train_set, test_set = load_cifar10_data()
+    train_set, test_set = load_celeba_hq256_data()
 
     train_dataset = DiffusionDataset(train_set, noise_schedule)
     val_dataset = DiffusionDataset(test_set, noise_schedule, train=False)
 
     model = UNet(original_channels=3, 
-                 base_channels=config["cifar10"]["base_channels"], 
-                 channel_multipliers=config["cifar10"]["channel_multipliers"],
-                 num_res_blocks=config["cifar10"]["num_res_blocks"],
-                 in_resolution=config["cifar10"]["in_resolution"])
+                 base_channels=config["model"]["base_channels"], 
+                 channel_multipliers=config["model"]["channel_multipliers"],
+                 num_res_blocks=config["model"]["num_res_blocks"],
+                 in_resolution=config["model"]["in_resolution"])
     
+    print(f"Model parameter count: {sum(p.numel() for p in model.parameters())}")
+
     trainer = Trainer(
         model=model,
         train_dataset=train_dataset,

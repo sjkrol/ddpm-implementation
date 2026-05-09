@@ -196,7 +196,11 @@ def load_model(checkpoint_path: str,
     :rtype: torch.nn.Module
     """
 
-    model = UNet()  # Initialize your model architecture
+    model = UNet(original_channels=3, 
+                 base_channels=config["model"]["base_channels"], 
+                 channel_multipliers=config["model"]["channel_multipliers"],
+                 num_res_blocks=config["model"]["num_res_blocks"],
+                 in_resolution=config["model"]["in_resolution"])
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.to(device)
     model.eval()
@@ -543,9 +547,9 @@ if __name__ == "__main__":
 
     model = load_model(model_path, config, device)
     noise_schedule = calculate_noise_schedule(
-        config["cifar10"]["T"],
-        config["cifar10"]["beta_start"],
-        config["cifar10"]["beta_end"],
+        config["model"]["T"],
+        config["model"]["beta_start"],
+        config["model"]["beta_end"],
     ).to(device)
 
     # fid_num_real = config["evaluation"]["fid_samples"]
