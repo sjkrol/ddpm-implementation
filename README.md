@@ -1,122 +1,156 @@
-# DDPM From Scratch
+# DDPM Implementation
 
-> This repository contains **my own implementation of DDPM** (Denoising Diffusion Probabilistic Models), written by me with only **minimal AI input**. The goal of this project is to understand the model by building the core pieces myself in PyTorch.
+This repository contains a from-scratch PyTorch implementation of denoising diffusion probabilistic models (DDPM), plus DDIM sampling utilities.
 
-## Overview
+The current training pipeline is configured for CelebA-HQ 256x256 images, with CIFAR-10 utilities still available for evaluation experiments.
 
-This project is a personal diffusion-model implementation focused on CIFAR-10. It includes the main ingredients needed to train a DDPM-style noise prediction model:
+## What is implemented
 
-- a linear noise schedule
-- the forward diffusion process
-- a custom dataset wrapper that samples random timesteps
-- a U-Net backbone with residual blocks, time embeddings, and self-attention
-- a training loop with validation
-- plotting utilities for visualising data and noisy samples
+- Linear noise schedule with configurable T, beta_start, and beta_end.
+- Forward diffusion and random-timestep training objective (noise prediction).
+- DDPM U-Net backbone with residual blocks, timestep embeddings, and attention.
+- Exponential moving average (EMA) model tracking during training.
+- Optional Weights and Biases logging.
+- DDPM and DDIM sampling in inference.
+- Optional FID and Inception Score utilities in inference.
 
-This is primarily a **learning and implementation project**, rather than a polished production training framework.
-
-## Project Structure
+## Repository layout
 
 ```text
 .
-├── diffusion.py      # dataset loading, diffusion utilities, training loop
-├── Unet.py           # U-Net architecture used for noise prediction
-├── utils.py          # plotting and visualisation helpers
-├── config.yaml       # model and training hyperparameters
-├── CIFAR10.yaml      # diffusion schedule parameters
-├── checkpoints/      # saved training runs
-└── data/             # CIFAR-10 dataset
+├── diffusion.py                 # training entrypoint and trainer
+├── inference.py                 # sampling and optional evaluation metrics
+├── Unet.py                      # DDPM U-Net
+├── utils.py                     # plotting/helpers
+├── CELEBA-HQ_config.yaml        # CelebA-HQ 256 training config
+├── CIFAR10_config.yaml          # CIFAR-10 config template/experiment config
+├── datasets/
+│   ├── celeba_hq256.py          # CelebA-HQ disk loader
+│   └── cifar10.py               # CIFAR-10 loader
+├── checkpoints/                 # saved run directories
+├── data/                        # local datasets
+└── DEPENDENCIES.md              # dependency and environment details
 ```
 
-## Implemented Components
+## Environment setup
 
-### Diffusion process
-The implementation includes:
-
-- linear $\beta$ schedule from `beta_start` to `beta_end`
-- computation of $\bar{\alpha}_t$
-- forward noising of clean images into noisy samples
-
-### Model
-The model is a DDPM-style U-Net with:
-
-- residual convolutional blocks
-- sinusoidal timestep embeddings
-- GroupNorm + SiLU activations
-- dropout
-- self-attention at selected resolutions
-- skip connections between encoder and decoder
-
-### Training
-The training code:
-
-- loads CIFAR-10 using `torchvision`
-- creates noisy examples on the fly
-- trains the model to predict the injected Gaussian noise
-- reports training and validation loss
-- creates timestamped directories inside `checkpoints/`
-
-## Configuration
-
-There are two config files:
-
-### `CIFAR10.yaml`
-Controls the diffusion schedule:
-
-- `T`: number of diffusion steps
-- `beta_start`: starting noise value
-- `beta_end`: ending noise value
-
-### `config.yaml`
-Controls the model and optimisation setup:
-
-- `channel_multipliers`
-- `base_channels`
-- `num_res_blocks`
-- `in_resolution`
-- `batch_size`
-- `lr`
-- `num_epochs`
-
-## Installation
-
-Create a Python environment and install the main dependencies:
+Use the existing conda environment:
 
 ```bash
-pip install torch torchvision matplotlib pyyaml wandb
+conda activate aesthetic-evolution
 ```
 
-## Running Training
-
-From the repository root, run:
+Install core dependencies:
 
 ```bash
-python diffusion.py
+pip install -r requirements.txt
 ```
 
-To enable Weights & Biases logging, set `wandb.enabled: true` in `config.yaml`.
-You can also set `wandb.project`, `wandb.entity`, `wandb.run_name`, and `wandb.log_every_steps`.
+Install optional evaluation dependencies (for FID/IS in inference):
 
-The dataset will download automatically into the `data/` directory if needed.
+```bash
+pip install -r requirements-eval.txt
+```
 
-## CIFAR-10 Performance
+For exact environment reproduction, see environment.yml and DEPENDENCIES.md.
 
-Current reported generation quality on CIFAR-10:
+## Dataset setup
 
-- **FID:** 3.17
+### CelebA-HQ 256
 
-Lower FID indicates that generated samples are closer to the real CIFAR-10 distribution.
+Place image files in:
 
-### Denoising Process (CIFAR-10)
+```text
+data/celeba_hq_256/
+```
 
-![CIFAR-10 denoising process](plots/CIFAR10.png)
+Supported file extensions are .jpg, .jpeg, .png, .webp, and .bmp.
+
+The current training entrypoint in diffusion.py uses the CelebA-HQ loader.
+
+### CIFAR-10
+
+CIFAR-10 is downloaded automatically to data/ when using torchvision loaders.
+
+## Configuration files
+
+Both YAML config files follow the same structure:
+
+- model:
+	- channel_multipliers
+	- base_channels
+	- num_res_blocks
+	- in_resolution
+	- T
+	- beta_start
+	- beta_end
+- training:
+	- batch_size
+	- lr
+	- warmup_steps
+	- lr_scheduler (defined in YAML, currently disabled in the training entrypoint)
+	- num_epochs
+- evaluation:
+	- fid_samples
+	- fid_batch_size
+- wandb:
+	- enabled
+	- project
+	- entity
+	- run_name
+	- mode
+	- log_every_steps
+	- tags
+	- notes
+
+## Train
+
+Run training with a config path:
+
+```bash
+python diffusion.py --config CELEBA-HQ_config.yaml
+```
+
+What the trainer does:
+
+- Uses GPU if available.
+- Applies random horizontal flips on training images.
+- Uses Adam and linear warmup for learning rate.
+- Tracks an EMA copy of model weights.
+- Evaluates on a validation split each epoch.
+- Saves checkpoints to:
+
+```text
+checkpoints/<wandb.project>/<timestamp>/
+```
+
+Checkpoint files:
+
+- best_model.pth: best validation-loss checkpoint.
+- ema_model.pth: EMA weights (saved periodically and again at end of training).
+
+## Inference and sampling
+
+Run inference with:
+
+```bash
+python inference.py --model_path checkpoints/<project>/<run_timestamp>/best_model.pth --config_path CELEBA-HQ_config.yaml
+```
+
+Current default behavior in inference.py:
+
+- Loads the model checkpoint and noise schedule from config.
+- Generates 10 samples with DDIM (eta=0.2).
+- Saves outputs to:
+
+```text
+ddim_test_samples/
+```
+
+FID and Inception Score helper functions are implemented and can be enabled in inference.py when needed.
 
 ## Notes
 
-- This repo is intended to show my understanding of DDPMs through implementation.
-- The code is still a work in progress and may be refined as I continue experimenting.
-- The training script currently uses a local absolute path for `config.yaml`, so if you move the repo to a different location you may need to update that path.
-
-## Motivation
-
-I built this project to better understand how diffusion models work internally instead of only using prebuilt libraries. Writing the components myself helped me learn the mechanics of the forward process, timestep conditioning, and U-Net-based noise prediction.
+- This codebase is an implementation-focused project and evolves with ongoing experiments.
+- CelebA-HQ is the primary training target at the moment.
+- CIFAR-10 config and loaders remain useful for metric/evaluation workflows and smaller-scale experiments.
