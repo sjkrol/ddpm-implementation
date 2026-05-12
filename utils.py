@@ -1,8 +1,14 @@
 
-from typing import Tuple
-import random
+import os
 import torch
+import random
+import datetime
+
 import matplotlib.pyplot as plt
+
+from typing import Tuple, Optional, Dict, Any
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 
 LABEL_TO_CLASS = {
@@ -102,3 +108,155 @@ def plot_image_noisy_pairs(clean_images: torch.Tensor, noisy_images: torch.Tenso
         titles.extend([f"Clean - {LABEL_TO_CLASS[labels[i].item()]}", f"Noisy - {LABEL_TO_CLASS[labels[i].item()]}"])
 
     plot_images(images, titles, cols=2)
+
+
+# HELPER FUNCTIONS FOR DISTRIBUTED TRAINING
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Returns the underlying module when wrapped by DistributedDataParallel.
+    @author: Stephen Krol
+
+    :param model: the model to unwrap
+    :type model: torch.nn.Module
+    
+    :return: the unwrapped model
+    :rtype: torch.nn.Module
+    """
+
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def setup_distributed_training(distributed_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Initializes distributed state from config and torchrun environment variables.
+    @author: Stephen Krol
+
+    :param distributed_config: the distributed training configuration
+    :type distributed_config: dict
+
+    :return: the runtime context for distributed training
+    :rtype: dict
+    """
+
+    distributed_config = distributed_config or {}
+    enabled = bool(distributed_config.get("enabled", False))
+
+    if not enabled:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return {
+            "enabled": False,
+            "rank": 0,
+            "local_rank": 0,
+            "world_size": 1,
+            "is_main_process": True,
+            "device": device,
+        }
+
+    backend = distributed_config.get("backend") or ("nccl" if torch.cuda.is_available() else "gloo")
+    init_method = distributed_config.get("init_method", "env://")
+
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    except KeyError as exc:
+        raise RuntimeError(
+            "Distributed training requires torchrun-style launch environment variables: "
+            "RANK, LOCAL_RANK, and WORLD_SIZE."
+        ) from exc
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+
+    return {
+        "enabled": True,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "is_main_process": rank == 0,
+        "device": device,
+    }
+
+def cleanup_distributed_training(runtime_context: Dict[str, Any]) -> None:
+    """
+    Cleans up the active process group when distributed training is enabled.
+    @author: Stephen Krol
+
+    :param runtime_context: the runtime context for distributed training
+    :type runtime_context: dict
+    """
+
+    if runtime_context.get("enabled") and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def create_checkpoint_dir(
+    project_name: str,
+    runtime_context: Dict[str, Any],
+    base_dir: str = "checkpoints") -> str:
+    """
+    Creates a shared checkpoint directory name, only materialized by rank 0.
+    @author: Stephen Krol
+
+    :param project_name: the name of the project
+    :type project_name: str
+    :param runtime_context: the runtime context for distributed training
+    :type runtime_context: dict
+    :param base_dir: the base directory for checkpoints
+    :type base_dir: str
+
+    :return: the path to the checkpoint directory
+    :rtype: str
+    """
+
+    run_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if runtime_context["is_main_process"] else None
+
+    if runtime_context["enabled"]:
+        run_name_payload = [run_name]
+        dist.broadcast_object_list(run_name_payload, src=0)
+        run_name = run_name_payload[0]
+
+    save_dir = os.path.join(base_dir, project_name, run_name)
+
+    if runtime_context["is_main_process"]:
+        os.makedirs(save_dir, exist_ok=True)
+    if runtime_context["enabled"]:
+        dist.barrier()
+
+    return save_dir
+
+
+# TENSOR CORE HELPER FUNCTIONS
+
+def configure_tensor_core_backend(enabled: bool = True) -> None:
+    """
+    Configures CUDA backend flags for Tensor Core acceleration.
+
+    :param enabled: whether to enable Tensor Core-friendly backend settings
+    :type enabled: bool
+    """
+
+    if not torch.cuda.is_available():
+        return
+
+    if enabled:
+        # Allow TF32 kernels on Ampere+ for faster matmul/conv while keeping fp32 interfaces.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    else:
+        # Force full-fp32 path for users who want maximum numeric fidelity.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
