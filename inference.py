@@ -14,7 +14,7 @@ from typing import Tuple
 from torch.utils.data import DataLoader
 
 from Unet import UNet
-from diffusion import calculate_noise_schedule, calculate_alpha_bar, load_cifar10_data
+from diffusion import calculate_noise_schedule, calculate_alpha_bar, load_cifar10_data, configure_tensor_core_backend
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -30,7 +30,8 @@ def ddpm_sample(model: torch.nn.Module,
            noise_schedule: torch.Tensor,
            num_samples: int, 
            device: torch.device,
-           resolution: Tuple[int, int] = (32, 32)) -> torch.Tensor:
+           resolution: Tuple[int, int] = (32, 32),
+           use_mixed_precision: bool = True) -> torch.Tensor:
     """
     Function to generate samples from the trained model using DDPM sampling.
     @author: Stephen Krol
@@ -43,10 +44,17 @@ def ddpm_sample(model: torch.nn.Module,
     :type num_samples: int
     :param device: The device to run the sampling on (e.g., 'cuda' or 'cpu').
     :type device: torch.device
+    :param resolution: The resolution of generated samples.
+    :type resolution: Tuple[int, int]
+    :param use_mixed_precision: Whether to use autocast mixed precision on CUDA.
+    :type use_mixed_precision: bool
 
     :return: A tensor containing the generated samples.
     :rtype: torch.Tensor
     """
+
+    if device.type == "cuda":
+        configure_tensor_core_backend(enabled=use_mixed_precision)
 
     noise_schedule = noise_schedule.to(device)
     alpha_bar = calculate_alpha_bar(noise_schedule).to(device)
@@ -54,7 +62,7 @@ def ddpm_sample(model: torch.nn.Module,
     for t in tqdm(reversed(range(noise_schedule.shape[0]))):
         with torch.no_grad():
             
-            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t)
+            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t, use_mixed_precision)
 
     return x
 
@@ -62,7 +70,8 @@ def ddpm_update_helper(x: torch.Tensor,
                        model: torch.nn.Module,
                        noise_schedule: torch.Tensor,
                        alpha_bar: torch.Tensor,
-                       t: int) -> torch.Tensor:
+                       t: int,
+                       use_mixed_precision: bool = True) -> torch.Tensor:
     """
     Helper function to update the sample during the denoising process.
     @author: Stephen Krol
@@ -77,13 +86,22 @@ def ddpm_update_helper(x: torch.Tensor,
     :type alpha_bar: torch.Tensor
     :param t: The current timestep.
     :type t: int
+    :param use_mixed_precision: Whether to use autocast mixed precision on CUDA.
+    :type use_mixed_precision: bool
 
     :return: The updated sample tensor after one denoising step.
     :rtype: torch.Tensor
     """
 
-    T = torch.full((x.size(0),), t, device=device, dtype=torch.long) # Create a tensor for the current timestep
-    noise_pred =  model(x, T)  # Predict the noise at the current timestep
+    amp_enabled = x.device.type == "cuda" and bool(use_mixed_precision)
+    if amp_enabled and torch.cuda.is_bf16_supported():
+        autocast_dtype = torch.bfloat16
+    else:
+        autocast_dtype = torch.float16
+
+    T = torch.full((x.size(0),), t, device=x.device, dtype=torch.long) # Create a tensor for the current timestep
+    with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=amp_enabled):
+        noise_pred = model(x, T)  # Predict the noise at the current timestep
 
     a_t = 1 - noise_schedule[t]
 
@@ -101,7 +119,8 @@ def ddim_sample(model: torch.nn.Module,
                 device: torch.device,
                 resolution: Tuple[int, int] = (32, 32),
                 eta: float = 0.0,
-                sampling_steps: int = 200) -> torch.Tensor:
+                sampling_steps: int = 200,
+                use_mixed_precision: bool = True) -> torch.Tensor:
     """
     Function to generate samples from the trained model using DDIM sampling.
     @author: Stephen Krol
@@ -114,14 +133,21 @@ def ddim_sample(model: torch.nn.Module,
     :type num_samples: int
     :param device: The device to run the sampling on (e.g., 'cuda', 'cpu').
     :type device: torch.device
+    :param resolution: The resolution of generated samples.
+    :type resolution: Tuple[int, int]
     :param eta: The noise scale for DDIM sampling (default 0.0 for deterministic sampling).
     :type eta: float
     :param sampling_steps: The number of sampling steps to use (default 200).
     :type sampling_steps: int
+    :param use_mixed_precision: Whether to use autocast mixed precision on CUDA.
+    :type use_mixed_precision: bool
 
     :return: A tensor containing the generated samples.
     :rtype: torch.Tensor
     """
+
+    if device.type == "cuda":
+        configure_tensor_core_backend(enabled=use_mixed_precision)
 
     noise_schedule = noise_schedule.to(device)
     alpha_bar = calculate_alpha_bar(noise_schedule).to(device)
@@ -136,7 +162,7 @@ def ddim_sample(model: torch.nn.Module,
         with torch.no_grad():
 
             t_prev = t_s[i + 1] if i < len(t_s) - 1 else 0 # because t_s is reversed, the "previous" timestep is actually the next one in the list
-            x = ddim_update_helper(x, model, noise_schedule, alpha_bar, t, t_prev, eta)
+            x = ddim_update_helper(x, model, noise_schedule, alpha_bar, t, t_prev, eta, use_mixed_precision)
 
     return x
 
@@ -146,7 +172,8 @@ def ddim_update_helper(x: torch.Tensor,
                        alpha_bar: torch.Tensor,
                        t: int,
                        t_prev: int,
-                       eta: float) -> torch.Tensor:
+                       eta: float,
+                       use_mixed_precision: bool = True) -> torch.Tensor:
     """
     Helper function to update the sample during the DDIM denoising process.
     @author: Stephen Krol
@@ -165,12 +192,21 @@ def ddim_update_helper(x: torch.Tensor,
     :type t_prev: int
     :param eta: The noise scale for DDIM sampling.
     :type eta: float
+    :param use_mixed_precision: Whether to use autocast mixed precision on CUDA.
+    :type use_mixed_precision: bool
 
     :return: The updated sample tensor after one DDIM denoising step.
     :rtype: torch.Tensor
     """
 
-    noise_pred = model(x, torch.full((x.size(0),), t, device=device, dtype=torch.long))
+    amp_enabled = x.device.type == "cuda" and bool(use_mixed_precision)
+    if amp_enabled and torch.cuda.is_bf16_supported():
+        autocast_dtype = torch.bfloat16
+    else:
+        autocast_dtype = torch.float16
+
+    with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=amp_enabled):
+        noise_pred = model(x, torch.full((x.size(0),), t, device=x.device, dtype=torch.long))
     sigma_t = eta * ((1 - alpha_bar[t_prev]) / (1 - alpha_bar[t])).sqrt() * (1 - alpha_bar[t] / alpha_bar[t_prev]).sqrt() if t > 0 else 0.0
 
     if t > 0:
@@ -244,7 +280,8 @@ def calculate_fid(model: torch.nn.Module,
                   num_fake: int,
                   batch_size: int,
                   device: torch.device,
-                  fake_batches: list = None) -> float:
+                  fake_batches: list = None,
+                  use_mixed_precision: bool = True) -> float:
     """
     Calculates FID against the CIFAR10 training split using generated samples.
     This matches the evaluation setup reported in the DDPM paper.
@@ -265,6 +302,8 @@ def calculate_fid(model: torch.nn.Module,
     :param fake_batches: Optional pre-generated list of uint8 fake image tensors. If
         provided, sample generation is skipped and these batches are used directly.
     :type fake_batches: list, optional
+    :param use_mixed_precision: Whether to use autocast mixed precision when generating fake samples.
+    :type use_mixed_precision: bool
 
     :return: The calculated FID score.
     :rtype: float
@@ -304,7 +343,7 @@ def calculate_fid(model: torch.nn.Module,
         seen_fake = 0
         while seen_fake < num_fake:
             current_batch = min(batch_size, num_fake - seen_fake)
-            fake_batch = sample(model, noise_schedule, current_batch, device)
+            fake_batch = ddpm_sample(model, noise_schedule, current_batch, device, use_mixed_precision=use_mixed_precision)
             fid.update(_to_fid_uint8(fake_batch), real=False)
             seen_fake += current_batch
 
@@ -318,7 +357,8 @@ def calculate_inception_score(
         batch_size: int,
         device: torch.device,
         splits: int = 10,
-        fake_batches: list = None) -> Tuple[float, float]:
+    fake_batches: list = None,
+    use_mixed_precision: bool = True) -> Tuple[float, float]:
     """
     Calculates the Inception Score (IS) for generated samples.
 
@@ -342,6 +382,8 @@ def calculate_inception_score(
     :param fake_batches: Optional pre-generated list of uint8 fake image tensors. If
         provided, sample generation is skipped and these batches are used directly.
     :type fake_batches: list, optional
+    :param use_mixed_precision: Whether to use autocast mixed precision when generating fake samples.
+    :type use_mixed_precision: bool
 
     :return: A tuple of (IS mean, IS std).
     :rtype: Tuple[float, float]
@@ -362,7 +404,7 @@ def calculate_inception_score(
         seen_fake = 0
         while seen_fake < num_fake:
             current_batch = min(batch_size, num_fake - seen_fake)
-            fake_batch = sample(model, noise_schedule, current_batch, device)
+            fake_batch = ddpm_sample(model, noise_schedule, current_batch, device, use_mixed_precision=use_mixed_precision)
             is_metric.update(_to_fid_uint8(fake_batch))
             seen_fake += current_batch
 
@@ -375,7 +417,8 @@ def calculate_metrics(model: torch.nn.Module,
                       num_real: int,
                       num_fake: int,
                       batch_size: int,
-                      device: torch.device) -> dict:
+                      device: torch.device,
+                      use_mixed_precision: bool = True) -> dict:
     """
     Function to calculate evaluation metrics for generated samples.
     Samples are generated once and shared between FID and IS to avoid redundant computation.
@@ -393,6 +436,8 @@ def calculate_metrics(model: torch.nn.Module,
     :type batch_size: int
     :param device: The device to run the evaluation on (e.g., 'cuda' or 'cpu').
     :type device: torch.device
+    :param use_mixed_precision: Whether to use autocast mixed precision when generating fake samples.
+    :type use_mixed_precision: bool
 
     
     :return: A dictionary containing the calculated metrics.
@@ -404,7 +449,7 @@ def calculate_metrics(model: torch.nn.Module,
     seen_fake = 0
     while seen_fake < num_fake:
         current_batch = min(batch_size, num_fake - seen_fake)
-        fake_batch = ddpm_sample(model, noise_schedule, current_batch, device)
+        fake_batch = ddpm_sample(model, noise_schedule, current_batch, device, use_mixed_precision=use_mixed_precision)
         fake_batches.append(_to_fid_uint8(fake_batch).cpu())
         seen_fake += current_batch
 
@@ -416,6 +461,7 @@ def calculate_metrics(model: torch.nn.Module,
         batch_size=batch_size,
         device=device,
         fake_batches=fake_batches,
+        use_mixed_precision=use_mixed_precision,
     )
 
     is_mean, is_std = calculate_inception_score(
@@ -425,6 +471,7 @@ def calculate_metrics(model: torch.nn.Module,
         batch_size=batch_size,
         device=device,
         fake_batches=fake_batches,
+        use_mixed_precision=use_mixed_precision,
     )
 
     metrics = {
@@ -465,7 +512,8 @@ def plot_denoising_process(model: torch.nn.Module,
                            step_interval: int = 5,
                            spacing_strength: float = 1.5,
                            resolution: Tuple[int, int] = (32, 32),
-                           save_path: str = "denoising_process.png") -> None:
+                           save_path: str = "denoising_process.png",
+                           use_mixed_precision: bool = True) -> None:
     """
     Function to visualize the denoising process of the diffusion model.
     @author: Stephen Krol
@@ -484,6 +532,8 @@ def plot_denoising_process(model: torch.nn.Module,
     :type resolution: Tuple[int, int]
     :param save_path: The path to save the visualization image (default is "denoising_process.png").
     :type save_path: str
+    :param use_mixed_precision: Whether to use autocast mixed precision on CUDA.
+    :type use_mixed_precision: bool
 
     :return: None
     :rtype: None
@@ -506,7 +556,7 @@ def plot_denoising_process(model: torch.nn.Module,
     images = []
     for t in tqdm(reversed(range(noise_schedule.shape[0])), desc="Denoising process"):
         with torch.no_grad():
-            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t)
+            x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t, use_mixed_precision)
 
         if t in step_indices_set or t == 0:
             images.append(x.cpu())
@@ -529,7 +579,6 @@ def plot_denoising_process(model: torch.nn.Module,
 
 if __name__ == "__main__":
 
-
     parser = argparse.ArgumentParser(description="Inference script for DDPM model")
     parser.add_argument("--model_path", type=str, help="Path to the model checkpoint")
     parser.add_argument("--config_path", type=str, default="config.yaml", help="Path to the config file")
@@ -537,9 +586,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     with open(args.config_path, "r") as f:
         config = yaml.safe_load(f)
+
+    precision_mode = str(config.get("precision", {}).get("mode", "mixed")).lower()
+    if precision_mode not in {"mixed", "fp32"}:
+        raise ValueError(f"Unsupported precision.mode: {precision_mode}. Use 'mixed' or 'fp32'.")
+    use_mixed_precision = precision_mode == "mixed"
+
+    configure_tensor_core_backend(enabled=use_mixed_precision)
+
+    amp_enabled = device.type == "cuda" and use_mixed_precision
+    amp_dtype = "bfloat16" if amp_enabled and torch.cuda.is_bf16_supported() else ("float16" if amp_enabled else "fp32")
+    print(f"[precision] mode={precision_mode} device={device} amp={'on' if amp_enabled else 'off'} dtype={amp_dtype}")
 
     model_path = args.model_path
     if model_path is None:
@@ -566,7 +626,7 @@ if __name__ == "__main__":
     # )
     # print(f"FID ({fid_num_fake} fake / {fid_num_real} real): {metrics['FID']:.4f}")
 
-    samples = ddim_sample(model, noise_schedule, 10, device, eta=0.2)
+    samples = ddim_sample(model, noise_schedule, 10, device, eta=0.2, use_mixed_precision=use_mixed_precision)
     save_samples(samples, "ddim_test_samples")
 
     # plot_denoising_process(
