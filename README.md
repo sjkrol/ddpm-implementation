@@ -2,7 +2,7 @@
 
 This repository contains a from-scratch PyTorch implementation of denoising diffusion probabilistic models (DDPM), plus DDIM sampling utilities.
 
-The current training pipeline is configured for CelebA-HQ 256x256 images, with CIFAR-10 utilities still available for evaluation experiments.
+The repository includes training and sampling utilities for both CelebA-HQ 256x256 and CIFAR-10, with the current primary training setup focused on CelebA-HQ.
 
 ## What is implemented
 
@@ -173,8 +173,22 @@ ddim_test_samples/
 
 FID and Inception Score helper functions are implemented and can be enabled in inference.py when needed.
 
+## CIFAR-10 Results
+
+The repository also includes CIFAR-10 experiments and reported results from the DDPM training pipeline.
+
+Reported quantitative result:
+
+- FID: 3.17
+
+Qualitative progression / sample visualization:
+
+![CIFAR-10 results](plots/CIFAR10.png)
+
+These results are retained here for reference even though the current training setup is primarily focused on CelebA-HQ 256x256.
+
 ## Notes
 
 - This codebase is an implementation-focused project and evolves with ongoing experiments.
 - CelebA-HQ is the primary training target at the moment.
-- CIFAR-10 config and loaders remain useful for metric/evaluation workflows and smaller-scale experiments.
+- CIFAR-10 remains a supported experiment target and includes reported benchmark results in this README.
