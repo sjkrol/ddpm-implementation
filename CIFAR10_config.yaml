@@ -7,10 +7,18 @@ model:
   beta_start: 0.0001
   beta_end: 0.02
 
+precision:
+  mode: mixed
+
 training:
   batch_size: 128
   lr: 2e-4
   warmup_steps: 5000
+  distributed:
+    enabled: false
+    backend: nccl
+    init_method: env://
+    find_unused_parameters: false
   lr_scheduler:
     step_size: 10
     gamma: 0.1
@@ -24,7 +32,7 @@ wandb:
   enabled: true
   project: ddpm-cifar10
   entity: "stephen-krol-monash-university"
-  run_name: run-7
+  run_name: test-run-7
   mode: online
   log_every_steps: 10
   tags: [ddpm, cifar10]
