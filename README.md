@@ -88,6 +88,10 @@ Both YAML config files follow the same structure:
 	- batch_size
 	- lr
 	- warmup_steps
+	- distributed.enabled
+	- distributed.backend
+	- distributed.init_method
+	- distributed.find_unused_parameters
 	- lr_scheduler (defined in YAML, currently disabled in the training entrypoint)
 	- num_epochs
 - evaluation:
@@ -105,15 +109,35 @@ Both YAML config files follow the same structure:
 
 ## Train
 
-Run training with a config path:
+Run single-process training with a config path and dataset:
 
 ```bash
-python diffusion.py --config CELEBA-HQ_config.yaml
+python diffusion.py --config CELEBA-HQ_config.yaml --dataset celeba_hq256
 ```
+
+Run CIFAR-10 training the same way:
+
+```bash
+python diffusion.py --config CIFAR10_config.yaml --dataset cifar10
+```
+
+To enable multi-GPU DistributedDataParallel training, set `training.distributed.enabled: true` in the config and launch with `torchrun`:
+
+```bash
+torchrun --nproc_per_node=2 diffusion.py --config CELEBA-HQ_config.yaml --dataset celeba_hq256
+```
+
+Distributed training notes:
+
+- `training.batch_size` is interpreted as per-process batch size.
+- Effective global batch size is `training.batch_size * world_size`.
+- Weights & Biases logging and checkpoint writes happen only on rank 0.
+- Validation currently runs on rank 0 only to avoid duplicated samples across distributed workers.
 
 What the trainer does:
 
 - Uses GPU if available.
+- Uses `DistributedDataParallel` when `training.distributed.enabled` is true.
 - Applies random horizontal flips on training images.
 - Uses Adam and linear warmup for learning rate.
 - Tracks an EMA copy of model weights.
