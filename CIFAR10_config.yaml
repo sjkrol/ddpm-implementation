@@ -25,8 +25,10 @@ training:
   num_epochs: 2051
 
 evaluation:
-  fid_samples: 50000
+  fid_samples: 1000
   fid_batch_size: 256
+  fid_eval_interval: 100
+  fid_feature: 64
 
 wandb:
   enabled: true
