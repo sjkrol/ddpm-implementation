@@ -1,5 +1,7 @@
 
 from typing import Tuple, Optional, Dict, Any
+from itertools import islice
+import time
 
 import os
 import datetime
@@ -15,47 +17,19 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from Unet import UNet
 
-from utils import unwrap_model, setup_distributed_training, cleanup_distributed_training, create_checkpoint_dir, configure_tensor_core_backend
+from utils import (unwrap_model, 
+                   setup_distributed_training, 
+                   cleanup_distributed_training, 
+                   create_checkpoint_dir, 
+                   configure_tensor_core_backend,
+                   calculate_noise_schedule,
+                   calculate_alpha_bar)
+
 from datasets.cifar10 import load_cifar10_data
 from datasets.celeba_hq256 import load_celeba_hq256_data
 
 # TODO: move to config
 EMA_DECAY = 0.9999
-
-
-def calculate_noise_schedule(T: int, beta_start: float, beta_end: float) -> torch.Tensor:
-    """
-    Returns the noise schedule for the diffusion process.
-    @author: Stephen Krol
-
-    :param T: the number of timesteps
-    :type T: int
-    :param beta_start: the starting value of beta
-    :type beta_start: float
-    :param beta_end: the ending value of beta
-    :type beta_end: float
-    
-    :return: the noise schedule
-    :rtype: torch.Tensor
-    """
-    return torch.linspace(beta_start, beta_end, T)
-
-def calculate_alpha_bar(noise_schedule: torch.Tensor) -> torch.Tensor:
-    """
-    Returns the alpha_bar value for a given timestep.
-    @author: Stephen Krol
-
-    :param noise_schedule: the noise schedule
-    :type noise_schedule: torch.Tensor
-
-    :type T: int
-    :param noise_schedule: the noise schedule
-    :type noise_schedule: torch.Tensor
-
-    :return: the alpha_bar value
-    :rtype: torch.Tensor
-    """
-    return torch.cumprod(1 - noise_schedule, dim=0)
 
 
 def forward_diffusion_sample(x_0: torch.tensor,
@@ -83,6 +57,35 @@ def forward_diffusion_sample(x_0: torch.tensor,
     noise = torch.randn_like(x_0).to(device)
 
     return torch.sqrt(alpha_bar[t])*x_0 + torch.sqrt(1 - alpha_bar[t])*noise, noise
+
+
+def _fid_compute_torch(fid_metric) -> float:
+    """
+    Recomputes FID from a fitted FrechetInceptionDistance metric using torch.linalg,
+    bypassing scipy.linalg.sqrtm which deadlocks against PyTorch's BLAS thread pool.
+    @author: Stephen Krol
+
+    The trace term uses the identity Tr(sqrtm(A B)) = sum(sqrt(eig(sqrtm(A) B sqrtm(A))))
+    so both matrix square roots reduce to eigh on symmetric PSD matrices.
+    """
+    n_r = fid_metric.real_features_num_samples
+    n_f = fid_metric.fake_features_num_samples
+
+    mu_r = fid_metric.real_features_sum / n_r
+    mu_f = fid_metric.fake_features_sum / n_f
+    sigma_r = fid_metric.real_features_cov_sum / n_r - torch.outer(mu_r, mu_r)
+    sigma_f = fid_metric.fake_features_cov_sum / n_f - torch.outer(mu_f, mu_f)
+
+    # sqrtm(sigma_r) via eigendecomposition — safe because sigma_r is symmetric PSD
+    eigvals_r, eigvecs_r = torch.linalg.eigh(sigma_r)
+    C = eigvecs_r @ torch.diag(eigvals_r.clamp(min=0).sqrt()) @ eigvecs_r.T
+
+    # Tr(sqrtm(sigma_r @ sigma_f)) = sum(sqrt(eigvalsh(C @ sigma_f @ C)))
+    trace_sqrt = torch.linalg.eigvalsh(C @ sigma_f @ C).clamp(min=0).sqrt().sum()
+
+    diff = mu_r - mu_f
+    fid = diff @ diff + sigma_r.trace() + sigma_f.trace() - 2.0 * trace_sqrt
+    return float(fid.item())
 
 
 class DiffusionDataset(torch.utils.data.Dataset):
@@ -132,9 +135,9 @@ class Trainer:
     A trainer class for the diffusion model.
     """
 
-    def __init__(self, 
-                 model: torch.nn.Module, 
-                 train_dataset: torch.utils.data.Dataset, 
+    def __init__(self,
+                 model: torch.nn.Module,
+                 train_dataset: torch.utils.data.Dataset,
                  val_dataset: torch.utils.data.Dataset,
                  batch_size: int,
                  lr: float,
@@ -143,7 +146,9 @@ class Trainer:
                  lr_scheduler: bool = True,
                  runtime_context: Optional[Dict[str, Any]] = None,
                  distributed_config: Optional[Dict[str, Any]] = None,
-                 wandb_config: Optional[Dict[str, Any]] = None):
+                 wandb_config: Optional[Dict[str, Any]] = None,
+                 eval_config: Optional[Dict[str, Any]] = None,
+                 fast_dev_run: bool = False):
         """
         Initializes the trainer with the given model, datasets, and training parameters.
         @author: Stephen Krol
@@ -170,6 +175,11 @@ class Trainer:
         :type distributed_config: dict, optional
         :param wandb_config: the configuration for Weights & Biases logging
         :type wandb_config: dict, optional
+        :param eval_config: evaluation settings (fid_samples, fid_batch_size, fid_eval_interval)
+        :type eval_config: dict, optional
+        :param fast_dev_run: if True, limits each phase to 2 batches and runs FID every epoch with one
+            batch of samples — useful for quickly validating the full training loop end-to-end
+        :type fast_dev_run: bool
         """
 
         # set context and configuration defaults, then initialize distributed training if enabled, and log the effective training precision
@@ -318,6 +328,27 @@ class Trainer:
             )
             wandb.watch(self.model_for_saving, log="all", log_freq=self.wandb_log_every_steps)
 
+        # Store evaluation settings for periodic FID computation during training
+        eval_config = eval_config or {}
+        self.fid_samples = int(eval_config.get("fid_samples", 1000))
+        self.fid_batch_size = int(eval_config.get("fid_batch_size", 256))
+        self.fid_eval_interval = int(eval_config.get("fid_eval_interval", 100))
+        res = int(eval_config.get("image_resolution", 32))
+        self.image_resolution = (res, res)
+
+        # get fid features and validate
+        self.fid_feature = int(eval_config.get("fid_feature", 64))
+        _valid_fid_features = {64, 192, 768, 2048}
+        if self.fid_feature not in _valid_fid_features:
+            raise ValueError(
+                f"fid_feature={self.fid_feature} is not a valid Inception V3 layer. "
+                f"Must be one of {sorted(_valid_fid_features)}."
+            )
+
+        self.fast_dev_run = bool(fast_dev_run)
+        if self.fast_dev_run:
+            self._log("[fast_dev_run] enabled — limiting to 2 batches per phase")
+
         # Set up directory for saving checkpoints
         project_name = wandb_config.get("project", "ddpm-training")
         self.save_dir = create_checkpoint_dir(project_name, runtime_context)
@@ -335,6 +366,9 @@ class Trainer:
 
         best_val_loss = float("inf")
         interrupted = False
+        _max_batches = 2 if self.fast_dev_run else None
+        _eval_samples = self.fid_batch_size if self.fast_dev_run else self.fid_samples
+        _eval_interval = 1 if self.fast_dev_run else self.fid_eval_interval
 
         try:
             # iterate over epochs and batches, calculating training and validation loss, and logging to Weights & Biases
@@ -350,10 +384,10 @@ class Trainer:
                     train_iterator = tqdm(
                         self.train_dataloader,
                         desc=f"Epoch {epoch + 1}/{num_epochs} [train]",
-                        leave=False,
+                        leave=True,
                     )
 
-                for batch in train_iterator:
+                for batch in islice(train_iterator, _max_batches):
                     x_0, _ = batch
                     x_0 = x_0.to(self.device, non_blocking=True)
                     x_t, t, eps = self._batch_forward_diffusion_sample(x_0)
@@ -400,6 +434,7 @@ class Trainer:
                     val_loss_total = 0.0
                     val_samples = 0
                     self.model.eval()
+                    
                     with torch.no_grad():
                         val_iterator = self.val_dataloader
                         if self.is_main_process:
@@ -408,7 +443,8 @@ class Trainer:
                                 desc=f"Epoch {epoch + 1}/{num_epochs} [val]",
                                 leave=False,
                             )
-                        for batch in val_iterator:
+
+                        for batch in islice(val_iterator, _max_batches):
                             x_0, _ = batch
                             x_0 = x_0.to(self.device, non_blocking=True)
                             x_t, t, eps = self._batch_forward_diffusion_sample(x_0)
@@ -420,11 +456,19 @@ class Trainer:
                             batch_size_actual = x_0.size(0)
                             val_loss_total += loss.item() * batch_size_actual
                             val_samples += batch_size_actual
+                            
                             if self.is_main_process:
                                 val_iterator.set_postfix(loss=f"{loss.item():.4f}")
 
                     val_loss = val_loss_total / max(val_samples, 1)
                     self._log(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {val_loss:.4f}")
+
+                # compute FID on the main process every _eval_interval epochs
+                if self.is_main_process and self.val_dataloader is not None and (epoch + 1) % _eval_interval == 0:
+                    fid_score = self._evaluate_fid(_eval_samples)
+                    self._log(f"Epoch {epoch+1}/{num_epochs}, FID ({_eval_samples} samples): {fid_score:.4f}")
+                    if self.wandb_enabled:
+                        wandb.log({"val/fid": fid_score, "epoch": epoch + 1}, step=self.global_step)
 
                 # save model checkpoint if validation loss has improved
                 if self.is_main_process and val_loss is not None and val_loss < best_val_loss:
@@ -521,6 +565,59 @@ class Trainer:
             else:
                 ema_val.copy_(model_val)
 
+    @torch.no_grad()
+    def _evaluate_fid(self, num_samples: Optional[int] = None) -> float:
+        """
+        Calculates FID between val-set real images and samples from the EMA model.
+        @author: Stephen Krol
+
+        :param num_samples: number of real/fake images to use; defaults to self.fid_samples
+        :type num_samples: int, optional
+        :return: FID score.
+        :rtype: float
+        """
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+        except ImportError:
+            raise ImportError(
+                "torchmetrics with image FID support is required. "
+                "Install with: pip install torchmetrics[image]"
+            )
+        from inference import ddpm_sample, _to_fid_uint8
+
+        n = num_samples if num_samples is not None else self.fid_samples
+        fid = FrechetInceptionDistance(feature=self.fid_feature, normalize=False).to(self.device)
+
+        seen_real = 0
+        with tqdm(total=n, desc="FID real", leave=False, unit="img") as pbar:
+            for real_batch, _ in self.val_dataloader:
+                if seen_real >= n:
+                    break
+                remaining = n - seen_real
+                real_batch = real_batch[:remaining].to(self.device)
+                fid.update(_to_fid_uint8(real_batch), real=True)
+                seen_real += real_batch.size(0)
+                pbar.update(real_batch.size(0))
+
+        seen_fake = 0
+        with tqdm(total=n, desc="FID fake", leave=True, unit="img") as pbar:
+            while seen_fake < n:
+                current_batch = min(self.fid_batch_size, n - seen_fake)
+                fake_batch = ddpm_sample(
+                    self.ema_model, self.noise_schedule, current_batch,
+                    self.device, resolution=self.image_resolution,
+                    use_mixed_precision=self.amp_enabled,
+                )
+                fid.update(_to_fid_uint8(fake_batch), real=False)
+                seen_fake += current_batch
+                pbar.update(current_batch)
+
+        tqdm.write("  Computing FID score...")
+        t0 = time.time()
+        score = _fid_compute_torch(fid)
+        tqdm.write(f"  FID score computed ({time.time() - t0:.1f}s)")
+        return score
+
     def _batch_forward_diffusion_sample(self, x_0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Applies forward diffusion to a whole batch on-device.
@@ -546,6 +643,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a DDPM on CIFAR-10")
     parser.add_argument("--config", type=str, help="Path to the configuration file")
     parser.add_argument("--dataset", help="Dataset to use (cifar10 or celeba_hq256)")
+    parser.add_argument("--fast-dev-run", action="store_true", help="Limit each phase to 2 batches for quick end-to-end validation")
     args = parser.parse_args()
 
     # read config file and set up distributed training
@@ -603,6 +701,8 @@ if __name__ == "__main__":
             runtime_context=runtime_context,
             distributed_config=distributed_config,
             wandb_config=config.get("wandb", {"enabled": False}),
+            eval_config=config.get("evaluation", {}),
+            fast_dev_run=args.fast_dev_run,
         )
 
         # run training loop, and save an interrupt checkpoint if training is stopped early by the user
