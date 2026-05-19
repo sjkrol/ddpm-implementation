@@ -110,6 +110,43 @@ def plot_image_noisy_pairs(clean_images: torch.Tensor, noisy_images: torch.Tenso
     plot_images(images, titles, cols=2)
 
 
+# DDPM HELPER FUNCTIONS
+
+def calculate_noise_schedule(T: int, beta_start: float, beta_end: float) -> torch.Tensor:
+    """
+    Returns the noise schedule for the diffusion process.
+    @author: Stephen Krol
+
+    :param T: the number of timesteps
+    :type T: int
+    :param beta_start: the starting value of beta
+    :type beta_start: float
+    :param beta_end: the ending value of beta
+    :type beta_end: float
+    
+    :return: the noise schedule
+    :rtype: torch.Tensor
+    """
+    return torch.linspace(beta_start, beta_end, T)
+
+def calculate_alpha_bar(noise_schedule: torch.Tensor) -> torch.Tensor:
+    """
+    Returns the alpha_bar value for a given timestep.
+    @author: Stephen Krol
+
+    :param noise_schedule: the noise schedule
+    :type noise_schedule: torch.Tensor
+
+    :type T: int
+    :param noise_schedule: the noise schedule
+    :type noise_schedule: torch.Tensor
+
+    :return: the alpha_bar value
+    :rtype: torch.Tensor
+    """
+    return torch.cumprod(1 - noise_schedule, dim=0)
+
+
 # HELPER FUNCTIONS FOR DISTRIBUTED TRAINING
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -177,6 +214,7 @@ def setup_distributed_training(distributed_config: Optional[Dict[str, Any]]) -> 
         init_method=init_method,
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", local_rank) if torch.cuda.is_available() else None,
     )
 
     return {

@@ -14,7 +14,8 @@ from typing import Tuple
 from torch.utils.data import DataLoader
 
 from Unet import UNet
-from diffusion import calculate_noise_schedule, calculate_alpha_bar, load_cifar10_data, configure_tensor_core_backend
+from utils import calculate_noise_schedule, calculate_alpha_bar, configure_tensor_core_backend
+from datasets.cifar10 import load_cifar10_data
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -59,7 +60,7 @@ def ddpm_sample(model: torch.nn.Module,
     noise_schedule = noise_schedule.to(device)
     alpha_bar = calculate_alpha_bar(noise_schedule).to(device)
     x = torch.randn(num_samples, 3, resolution[0], resolution[1], device=device)  # Start with random noise
-    for t in tqdm(reversed(range(noise_schedule.shape[0]))):
+    for t in tqdm(reversed(range(noise_schedule.shape[0])), desc="DDPM sampling", leave=False):
         with torch.no_grad():
             
             x = ddpm_update_helper(x, model, noise_schedule, alpha_bar, t, use_mixed_precision)
@@ -158,7 +159,7 @@ def ddim_sample(model: torch.nn.Module,
     step_size = max(1, total_steps // sampling_steps)
     t_s = list(reversed(range(0, total_steps, step_size))) # sampling timesteps in reverse order (from T-1 down to 0)
 
-    for i, t in tqdm(enumerate(t_s), desc="DDIM Sampling"):
+    for i, t in tqdm(enumerate(t_s), desc="DDIM sampling", total=len(t_s), leave=False):
         with torch.no_grad():
 
             t_prev = t_s[i + 1] if i < len(t_s) - 1 else 0 # because t_s is reversed, the "previous" timestep is actually the next one in the list
