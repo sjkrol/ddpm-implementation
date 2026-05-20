@@ -627,16 +627,17 @@ if __name__ == "__main__":
     # )
     # print(f"FID ({fid_num_fake} fake / {fid_num_real} real): {metrics['FID']:.4f}")
 
-    samples = ddim_sample(model, noise_schedule, 10, device, eta=0.2, use_mixed_precision=use_mixed_precision)
-    save_samples(samples, "ddim_test_samples")
+    # samples = ddim_sample(model, noise_schedule, 10, device, eta=0.2, use_mixed_precision=use_mixed_precision, resolution=(config["evaluation"]["image_resolution"], config["evaluation"]["image_resolution"]))
+    # samples = ddpm_sample(model, noise_schedule, 10, device, use_mixed_precision=use_mixed_precision, resolution=(config["evaluation"]["image_resolution"], config["evaluation"]["image_resolution"]))
+    # save_samples(samples, "ddim_test_samples")
 
-    # plot_denoising_process(
-    #     model=model,
-    #     noise_schedule=noise_schedule,
-    #     num_samples=5,
-    #     device=device,
-    #     step_interval=10,
-    #     spacing_strength=2.0,
-    #     resolution=(32, 32),
-    #     save_path="denoising_process.png",
-    # )
+    plot_denoising_process(
+        model=model,
+        noise_schedule=noise_schedule,
+        num_samples=5,
+        device=device,
+        step_interval=10,
+        spacing_strength=2.0,
+        resolution=(config["evaluation"]["image_resolution"], config["evaluation"]["image_resolution"]),
+        save_path="denoising_process.png",
+    )

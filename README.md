@@ -173,6 +173,18 @@ ddim_test_samples/
 
 FID and Inception Score helper functions are implemented and can be enabled in inference.py when needed.
 
+## CelebA-HQ Results
+
+The current primary training setup in this repository is focused on CelebA-HQ 256x256 experiments.
+
+Reported quantitative result:
+
+- FID: TBD
+
+Qualitative progression / sample visualization:
+
+![CelebA-HQ results](plots/CELEBA-HQ.png)
+
 ## CIFAR-10 Results
 
 The repository also includes CIFAR-10 experiments and reported results from the DDPM training pipeline.
